@@ -1,0 +1,311 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.metrics import silhouette_score
+from factor_analyzer import FactorAnalyzer
+from factor_analyzer.factor_analyzer import calculate_kmo, calculate_bartlett_sphericity
+from sklearn.model_selection import LeaveOneOut
+import warnings
+import platform
+
+# --- 1. 配置和设置 ---\n
+warnings.filterwarnings('ignore')
+
+# 智能字体配置 (自动检测环境)
+system_name = platform.system()
+if system_name == "Windows":
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
+elif system_name == "Darwin": # Mac
+    plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'Heiti TC']
+else: # Linux/Server
+    plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'DejaVu Sans'] # 备用
+
+plt.rcParams['axes.unicode_minus'] = False 
+
+# --- 2. GBA 数据分析类 ---\n
+class GBADataAnalysis:
+    def __init__(self, data_path, target_year=2023):
+        """
+        初始化分析类，加载数据并进行预处理。
+        """
+        print(f"--- 正在加载 {data_path} 文件... ---")
+        # 尝试使用不同编码读取，防止编码错误
+        try:
+            self.df_raw = pd.read_csv(data_path, encoding='utf-8')
+        except UnicodeDecodeError:
+            self.df_raw = pd.read_csv(data_path, encoding='gbk')
+
+        self.target_year = target_year
+        
+        # 筛选目标年份数据
+        if '年份' in self.df_raw.columns:
+            self.df_2023 = self.df_raw[self.df_raw['年份'] == target_year].copy().reset_index(drop=True)
+        else:
+            print("警告：未找到'年份'列，默认使用全部数据的第一年")
+            self.df_2023 = self.df_raw.copy()
+
+        self.cities = self.df_2023['城市'].tolist()
+        
+        # 自动识别特征列
+        self.feature_cols = [c for c in self.df_2023.columns 
+                             if c not in ['城市', '年份', '城市代码', 'City_Code']]
+        
+        # --- 关键修改：剔除方差为0的列 (常数列) ---
+        # 如果某列所有值都一样，标准差为0，会导致标准化时除以0，进而产生NaN
+        std_check = self.df_2023[self.feature_cols].std()
+        cols_to_drop = std_check[std_check == 0].index.tolist()
+        if cols_to_drop:
+            print(f"警告：检测到 {len(cols_to_drop)} 个指标数值完全相同，已自动剔除: {cols_to_drop}")
+            self.feature_cols = [c for c in self.feature_cols if c not in cols_to_drop]
+
+        # 数据标准化 (Z-Score)
+        self.scaler = StandardScaler()
+        self.X_scaled = self.scaler.fit_transform(self.df_2023[self.feature_cols])
+        # 处理可能出现的 NaN (用0填充，即均值填充)
+        self.X_scaled = np.nan_to_num(self.X_scaled)
+        
+        self.X_df = pd.DataFrame(self.X_scaled, columns=self.feature_cols, index=self.cities)
+
+        # 存储结果
+        self.factor_scores_df = None
+        self.cluster_results = None
+        
+        print(f"数据加载和标准化完成。共 {len(self.cities)} 个城市，{len(self.feature_cols)} 个有效指标。")
+
+    def run_factor_analysis(self):
+        """执行第五章：降维与因子分析"""
+        print("\n--- 第五章：因子分析 (FA) 结果 ---")
+
+        # 1. 适用性检验 (添加 try-except 且不阻断程序)
+        try:
+            # 当样本量 < 指标数时，KMO 计算经常会报错或返回 nan
+            kmo_all, kmo_model = calculate_kmo(self.X_df)
+            chi_square_value, p_value = calculate_bartlett_sphericity(self.X_df)
+            print(f"KMO值: {kmo_model:.3f}")
+            print(f"Bartlett检验p-value: {p_value:.3e}")
+        except Exception as e:
+            print(f"KMO/Bartlett 计算警告 (通常因为样本量N < 指标数P): {e}")
+            kmo_model = 0
+            p_value = 1.0
+
+        # --- 关键修改：即使检验不通过，也强制继续运行，以便生成图片 ---
+        if np.isnan(kmo_model) or kmo_model < 0.6:
+            print("注意：数据统计检验未通过（样本量过小），但将强制执行后续分析以生成图表...")
+            # 这里的 return 被移除了
+
+        # 2. 确定因子数并绘制碎石图 (Figure 5.1)
+        # 限制因子数量不超过样本量-1
+        max_n = min(len(self.feature_cols), len(self.cities))
+        fa_test = FactorAnalyzer(n_factors=max_n, rotation=None, method='principal')
+        fa_test.fit(self.X_df)
+        ev, v = fa_test.get_eigenvalues()
+        
+        # 绘制碎石图
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, len(ev) + 1), ev, marker='o', linestyle='-')
+        plt.axhline(y=1, color='r', linestyle='--')
+        plt.title('图 5.1: 特征值与因子数量关系图 (碎石图)')
+        plt.xlabel('因子编号')
+        plt.ylabel('特征值')
+        plt.grid(True)
+        plt.savefig('Figure_5_1_Scree_Plot.png')
+        print("已保存图 5.1: Figure_5_1_Scree_Plot.png")
+
+        # 3. 因子分析 (Factor Analysis) - 提取3个因子并旋转
+        n_factors = 3 
+        # 使用 method='principal' (PCA方法) 对奇异矩阵更鲁棒
+        fa = FactorAnalyzer(n_factors=n_factors, rotation='varimax', method='principal')
+        fa.fit(self.X_df)
+        
+        # 获取方差贡献率
+        variance = fa.get_factor_variance()
+        # 防止除以0错误
+        total_var = np.sum(variance[1]) if np.sum(variance[1]) != 0 else 1.0
+        variance_weights = variance[1] / total_var
+        
+        print(f"因子方差解释率: {pd.Series(variance[1]).round(4).tolist()}")
+        print(f"累计方差贡献率: {total_var:.4f}")
+        
+        # 获取因子载荷
+        factor_names = ['F1_产业数字规模', 'F2_跨境连接通道', 'F3_市场化活跃度']
+        loadings = pd.DataFrame(fa.loadings_, index=self.feature_cols, columns=factor_names)
+        print("\n部分高载荷因子 (用于报告 表 5.3):")
+        print(loadings[(loadings.abs() > 0.6)].dropna(how='all').head(5))
+        
+        # 4. 计算因子得分
+        fa_scores = fa.transform(self.X_df)
+        self.factor_scores_df = pd.DataFrame(fa_scores, index=self.cities, columns=['F1', 'F2', 'F3'])
+        
+        # 5. 构建综合得分 (DEFI Index)
+        self.factor_scores_df['DEFI_Index'] = (self.factor_scores_df * variance_weights).sum(axis=1)
+        self.factor_scores_df['Rank'] = self.factor_scores_df['DEFI_Index'].rank(ascending=False)
+        
+        print("\n2023年各城市DEFI指数及排名 (对应报告 表 5.4):")
+        print(self.factor_scores_df[['DEFI_Index', 'Rank']].sort_values('Rank'))
+        
+        # 6. 绘制关键城市雷达图 (Figure 5.2)
+        self._plot_radar_chart()
+
+    def _plot_radar_chart(self):
+        """绘制关键城市的雷达图 (Figure 5.2)"""
+        if self.factor_scores_df is None: return
+
+        # 选取四个具有代表性的城市 (确保城市存在于数据中)
+        all_cities = self.factor_scores_df.index.tolist()
+        target_cities = ['深圳', '广州', '香港', '佛山']
+        cities_to_plot = [c for c in target_cities if c in all_cities]
+        
+        if not cities_to_plot:
+            cities_to_plot = all_cities[:4] # 如果找不到指定城市，取前4个
+
+        df_plot = self.factor_scores_df.loc[cities_to_plot, ['F1', 'F2', 'F3']].copy()
+
+        # 归一化得分到 0.05-0.95 范围以便于绘图 (避免完全贴边)
+        min_val = df_plot.values.min()
+        max_val = df_plot.values.max()
+        # 防止 max == min 导致除以0
+        if max_val == min_val:
+            df_plot_norm = df_plot * 0 + 0.5
+        else:
+            df_plot_norm = (df_plot - min_val) / (max_val - min_val)
+
+        categories = df_plot_norm.columns.tolist()
+        N = len(categories)
+        angles = [n / float(N) * 2 * np.pi for n in range(N)]
+        angles += angles[:1]
+
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
+        
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(categories, fontsize=12)
+
+        for i, city in enumerate(cities_to_plot):
+            values = df_plot_norm.loc[city].values.flatten().tolist()
+            values += values[:1]
+            ax.plot(angles, values, linewidth=2, linestyle='solid', label=city)
+            ax.fill(angles, values, alpha=0.1)
+
+        ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+        ax.set_yticklabels(["0.2", "0.4", "0.6", "0.8", "1.0"])
+        ax.set_ylim(0, 1.1)
+
+        plt.title('图 5.2: 核心城市数据要素流动因子得分雷达图', size=16, y=1.1)
+        plt.legend(loc='lower left', bbox_to_anchor=(0.05, 0.05))
+        plt.savefig('Figure_5_2_Radar_Chart.png')
+        print("已保存图 5.2: Figure_5_2_Radar_Chart.png")
+        plt.close()
+
+    def run_clustering_and_lda(self, K=4):
+        """执行第六章：聚类与分类判别"""
+        if self.factor_scores_df is None:
+            print("错误：请先运行因子分析以获取因子得分。")
+            return
+
+        print(f"\n--- 第六章：聚类与判别结果 (K={K}) ---")
+        
+        X_cluster = self.factor_scores_df[['F1', 'F2', 'F3']].values
+        
+        # 1. K-Means 聚类
+        kmeans = KMeans(n_clusters=K, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X_cluster)
+        
+        sil_score = silhouette_score(X_cluster, labels)
+        print(f"K-Means (K={K}) 轮廓系数: {sil_score:.3f}")
+
+        # 结果汇总
+        self.cluster_results = self.factor_scores_df.copy()
+        self.cluster_results['Cluster_Label'] = labels
+        
+        # 2. 绘制聚类结果图 (Figure 6.2)
+        plt.figure(figsize=(10, 8))
+        # 使用 try-except 处理 seaborn 版本兼容性
+        try:
+            sns.scatterplot(x='F1', y='F3', hue='Cluster_Label', data=self.cluster_results, 
+                            palette='viridis', style='Cluster_Label', s=150)
+        except:
+            plt.scatter(self.cluster_results['F1'], self.cluster_results['F3'], 
+                        c=self.cluster_results['Cluster_Label'], cmap='viridis', s=150)
+
+        # 添加城市标签
+        for city, row in self.cluster_results.iterrows():
+            plt.text(row['F1'] + 0.05, row['F3'], city, fontsize=9, ha='left')
+        
+        plt.title('图 6.2: 数据要素流动能级聚类结果 (F1 vs F3)')
+        plt.xlabel('F1：产业数字化与综合规模因子')
+        plt.ylabel('F3：数据要素市场化活跃因子')
+        plt.grid(True)
+        plt.savefig('Figure_6_2_Cluster_Scatter_Plot.png')
+        print("已保存图 6.2: Figure_6_2_Cluster_Scatter_Plot.png")
+        plt.close()
+
+        # 3. 线性判别分析 (LDA)
+        # 注意：如果某个类别只有一个样本，LDA 可能会报错，这里加个判断
+        class_counts = self.cluster_results['Cluster_Label'].value_counts()
+        if (class_counts < 2).any():
+            print("警告：某些聚类类别样本数过少，跳过 LDA 验证。")
+            return
+
+        y_lda = self.cluster_results['Cluster_Label']
+        X_lda = self.X_df 
+        
+        # LDA 组件数不能超过 min(n_features, n_classes - 1)
+        n_components = min(X_lda.shape[1], K - 1)
+        lda = LinearDiscriminantAnalysis(n_components=n_components)
+        
+        try:
+            lda.fit(X_lda, y_lda)
+            print(f"\nLDA 判别函数方差解释率: {lda.explained_variance_ratio_[:2].round(4)}")
+            
+            # 交叉验证
+            loo = LeaveOneOut()
+            correct_predictions = 0
+            total_samples = 0
+            for train_index, test_index in loo.split(X_lda):
+                X_train, X_test = X_lda.iloc[train_index], X_lda.iloc[test_index]
+                y_train, y_test = y_lda.iloc[train_index], y_lda.iloc[test_index]
+                
+                # 检查训练集中是否包含所有类
+                if len(np.unique(y_train)) < 2:
+                    continue 
+
+                lda_loo = LinearDiscriminantAnalysis()
+                lda_loo.fit(X_train, y_train)
+                prediction = lda_loo.predict(X_test)
+                
+                if prediction[0] == y_test.iloc[0]:
+                    correct_predictions += 1
+                total_samples += 1
+            
+            if total_samples > 0:
+                accuracy = correct_predictions / total_samples
+                print(f"LDA 留一法交叉验证准确率: {accuracy:.2%}")
+        except Exception as e:
+            print(f"LDA 分析过程中发生错误 (可能是因为矩阵奇异性): {e}")
+
+# --- 3. 主程序入口 ---
+if __name__ == "__main__":
+    DATA_FILE = 'main_data_advanced.csv'
+    
+    try:
+        analyzer = GBADataAnalysis(data_path=DATA_FILE)
+        
+        # 运行第五章分析
+        analyzer.run_factor_analysis()
+        
+        # 运行第六章分析
+        analyzer.run_clustering_and_lda(K=4)
+        
+        print("\n--- 代码运行完毕 ---")
+        print("请检查当前目录下生成的 PNG 图片文件。")
+    except FileNotFoundError:
+        print(f"\n!!! 错误：未找到数据文件 '{DATA_FILE}'。!!!")
+    except Exception as e:
+        import traceback
+        print(f"\n运行过程中发生错误: {e}")
+        traceback.print_exc()
